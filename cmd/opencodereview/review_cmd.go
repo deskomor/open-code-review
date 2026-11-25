@@ -53,6 +53,8 @@ type reviewOptions struct {
 	effort                  string
 	noFilter                bool
 	preview                 bool
+	factoryRootReadme       bool
+	factoryReview           bool
 	analysis                bool
 	analysisMaxTokensBudget int
 }
@@ -123,6 +125,8 @@ func init() {
 }
 
 func executeReviewContext(ctx context.Context, opts reviewOptions) (retErr error) {
+	opts.factoryRootReadme = os.Getenv("OCR_FACTORY_ROOT_README") == "1"
+	opts.factoryReview = os.Getenv("OCR_FACTORY_REVIEW") == "1"
 	out, closeOut, err := resolveOutputWriter(opts.outputPath, opts.outputFormat)
 	if err != nil {
 		return err
@@ -258,6 +262,8 @@ func executeReviewContext(ctx context.Context, opts reviewOptions) (retErr error
 		Template:              *cc.Template,
 		SystemRule:            cc.Resolver,
 		FileFilter:            cc.FileFilter,
+		FactoryRootReadme:     opts.factoryRootReadme,
+		FactoryReview:         opts.factoryReview,
 		LLMClient:             rt.Client,
 		Tools:                 tools,
 		PlanToolDefs:          planToolDefs,
@@ -483,15 +489,17 @@ func validateResumeIdentity(ctx context.Context, cc *commonContext, opts reviewO
 		return nil, nil
 	}
 	sealed, err := agent.ResolveIdentity(ctx, agent.Args{
-		RepoDir:    cc.RepoDir,
-		From:       opts.from,
-		To:         opts.to,
-		Commit:     opts.commit,
-		ReviewMode: reviewModeFromOptions(opts),
-		Template:   *cc.Template,
-		SystemRule: cc.Resolver,
-		FileFilter: cc.FileFilter,
-		GitRunner:  cc.GitRunner,
+		RepoDir:           cc.RepoDir,
+		From:              opts.from,
+		To:                opts.to,
+		Commit:            opts.commit,
+		ReviewMode:        reviewModeFromOptions(opts),
+		Template:          *cc.Template,
+		SystemRule:        cc.Resolver,
+		FileFilter:        cc.FileFilter,
+		FactoryRootReadme: opts.factoryRootReadme,
+		FactoryReview:     opts.factoryReview,
+		GitRunner:         cc.GitRunner,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve current input identity: %w", err)
@@ -598,13 +606,15 @@ func runPreviewContext(ctx context.Context, cc *commonContext, opts reviewOption
 	tpl.MaxTokens = maxTokens
 
 	preview, err := agent.Preview(ctx, agent.Args{
-		RepoDir:    cc.RepoDir,
-		From:       opts.from,
-		To:         opts.to,
-		Commit:     opts.commit,
-		Template:   tpl,
-		FileFilter: cc.FileFilter,
-		GitRunner:  cc.GitRunner,
+		RepoDir:           cc.RepoDir,
+		From:              opts.from,
+		To:                opts.to,
+		Commit:            opts.commit,
+		Template:          tpl,
+		FileFilter:        cc.FileFilter,
+		FactoryRootReadme: opts.factoryRootReadme,
+		FactoryReview:     opts.factoryReview,
+		GitRunner:         cc.GitRunner,
 	})
 	if err != nil {
 		return fmt.Errorf("preview failed: %w", err)

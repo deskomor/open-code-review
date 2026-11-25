@@ -8,6 +8,7 @@ import (
 	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/llmloop"
 	"github.com/alibaba/open-code-review/internal/model"
+	"github.com/alibaba/open-code-review/internal/session"
 )
 
 // fileDecision is one changed file's pre-dispatch outcome: the diff, the
@@ -24,8 +25,8 @@ type fileDecision struct {
 func (d fileDecision) selected() bool { return d.Reason == ExcludeNone }
 
 // retained reports whether the file stays in the agent's working diff set.
-// Deletions are retained although they are never dispatched: they carry no new
-// content to review but still belong to the change-file list the prompts show.
+// Outside Factory review, deletions are retained although they are never
+// dispatched: they still belong to the change-file list the prompts show.
 func (d fileDecision) retained() bool {
 	return d.Reason == ExcludeNone || d.Reason == ExcludeDeleted
 }
@@ -47,7 +48,7 @@ func (a *Agent) selectFiles(diffs []model.Diff) []fileDecision {
 		dec := fileDecision{Diff: d, Reason: a.whyExcluded(d)}
 		switch {
 		case dec.Reason != ExcludeNone:
-		case d.IsDeleted:
+		case d.IsDeleted && !a.args.FactoryReview:
 			dec.Reason = ExcludeDeleted
 		case limit > 0:
 			// Counted only when a limit is configured, so the tokenizer pass is
@@ -90,7 +91,10 @@ func (a *Agent) whyExcluded(d model.Diff) ExcludeReason {
 	}
 
 	ext := a.extFromPath(path)
-	if ext != "" && !allowedext.IsAllowedExt(ext) {
+	rootReadme := a.args.FactoryRootReadme && path == "README.md" &&
+		(d.OldPath == path || (d.IsNew && d.OldPath == "/dev/null")) &&
+		(d.NewPath == path || (d.IsDeleted && d.NewPath == "/dev/null"))
+	if ext != "" && !allowedext.IsAllowedExt(ext) && !rootReadme {
 		return ExcludeExtension
 	}
 
@@ -99,6 +103,19 @@ func (a *Agent) whyExcluded(d model.Diff) ExcludeReason {
 	}
 
 	return ExcludeNone
+}
+
+// reduceSelection keeps workspace resume identity separate from dispatch eligibility.
+func (a *Agent) reduceSelection(decisions []fileDecision) ([]model.Diff, selectionCounts) {
+	a.workspaceIdentityOnly = nil
+	if a.reviewMode() == session.ReviewModeWorkspace {
+		for _, d := range decisions {
+			if d.Diff.IsDeleted && d.Reason == ExcludeTooLarge {
+				a.workspaceIdentityOnly = append(a.workspaceIdentityOnly, d.Diff)
+			}
+		}
+	}
+	return summarizeSelection(decisions)
 }
 
 // selectionCounts is the run-level rollup of one selection pass.

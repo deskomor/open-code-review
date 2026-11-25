@@ -41,8 +41,8 @@ func TestHumanTokens(t *testing.T) {
 // before dispatch). Also asserts a normal diff projects a sane positive value
 // bounded below by the fixed per-file overhead.
 func TestEstimateDiffFileTokens_ZeroForSkipped(t *testing.T) {
-	if got := estimateDiffFileTokens(model.Diff{IsDeleted: true, Diff: "+x"}); got != 0 {
-		t.Errorf("deleted diff projected %d tokens, want 0", got)
+	if got := estimateDiffFileTokens(model.Diff{IsDeleted: true, Diff: "-x"}); got != estimateDiffFileTokens(model.Diff{Diff: "-x"}) {
+		t.Errorf("deleted diff should carry normal patch cost, got %d", got)
 	}
 	if got := estimateDiffFileTokens(model.Diff{NewPath: "a.go", Diff: ""}); got != 0 {
 		t.Errorf("empty diff projected %d tokens, want 0", got)
@@ -67,16 +67,16 @@ func TestEstimateDiffCost(t *testing.T) {
 	diffs := []model.Diff{
 		{NewPath: "a.go", Diff: "+a\n"},
 		{NewPath: "b.go", Diff: "+b\n"},
-		{NewPath: "c.go", IsDeleted: true, Diff: "+c\n"}, // skipped
-		{NewPath: "d.go", Diff: ""},                      // skipped
+		{OldPath: "c.go", IsDeleted: true, Diff: "-c\n"},
+		{NewPath: "d.go", Diff: ""}, // skipped
 	}
 	est := estimateDiffCost(diffs)
-	if est.Files != 2 {
-		t.Errorf("Files = %d, want 2 (deleted + empty skipped)", est.Files)
+	if est.Files != 3 {
+		t.Errorf("Files = %d, want 3 (empty skipped)", est.Files)
 	}
 	perFile := estimateDiffFileTokens(diffs[0])
-	if est.TotalTokens != perFile*2 {
-		t.Errorf("TotalTokens = %d, want 2*%d = %d", est.TotalTokens, perFile, perFile*2)
+	if est.TotalTokens != perFile*2+estimateDiffFileTokens(diffs[2]) {
+		t.Errorf("TotalTokens = %d, want %d", est.TotalTokens, perFile*2+estimateDiffFileTokens(diffs[2]))
 	}
 	if est.InputTokens <= 0 || est.OutputTokens <= 0 {
 		t.Errorf("expected non-zero input/output splits, got in=%d out=%d", est.InputTokens, est.OutputTokens)

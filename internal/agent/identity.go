@@ -57,7 +57,7 @@ func ResolveIdentity(ctx context.Context, args Args) (*SealedInput, error) {
 	if err := a.loadDiffs(ctx); err != nil {
 		return nil, fmt.Errorf("load diffs: %w", err)
 	}
-	a.diffs, _ = summarizeSelection(a.selectFiles(a.diffs))
+	a.diffs, _ = a.reduceSelection(a.selectFiles(a.diffs))
 	if resolution != nil {
 		a.inputResolution = *resolution
 	}

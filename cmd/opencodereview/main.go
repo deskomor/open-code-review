@@ -19,6 +19,10 @@ func main() {
 }
 
 func run() int {
+	if len(os.Args) > 1 && os.Args[1] == "factory-review-request" {
+		return runFactoryReviewCLI(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	}
+
 	ctx := context.Background()
 	if telemetry.Init(ctx) {
 		defer telemetry.ShutdownWithTimeout(ctx, 5*time.Second)

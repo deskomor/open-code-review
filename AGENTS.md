@@ -19,6 +19,21 @@ Below are rules that a contributor must follow during development. If the user d
 
 open-code-review (`ocr`) is an AI-powered code review CLI tool written in Go (module: `github.com/alibaba/open-code-review`).
 
+### Factory review selection
+
+`OCR_FACTORY_REVIEW=1` (set by the Factory host for every review) dispatches deleted files for review; without it, deletions stay listed but unreviewed, as upstream.
+
+`OCR_FACTORY_ROOT_README=1` admits only the exact root `README.md` through the extension filter. Both paths must refer to that file (or `/dev/null` for an add or deletion). Other filters and the size limit still apply. Preview, review and resume identity use the same selection.
+
+### Factory host command
+
+- `ocr factory-review-request --model MODEL` is a host-only, pre-Cobra entry point. Keep it out of the normal user-facing command list.
+- It accepts at most 16 MiB of broker-checked Responses JSON on stdin and emits at most 32 MiB of raw SSE on stdout.
+- Exit 0 means only that a fixed-endpoint HTTP 200 response had an allowed media type and a non-empty bounded body. The Factory host must validate the terminal SSE event; an SSE error event can still exit 0.
+- The command uses only the active, fresh ChatGPT-plan grant from OCR's protected store. It never refreshes, falls back, exports the bearer token, follows redirects, uses a proxy, retries, or initializes normal CLI telemetry/configuration.
+- Exit codes 20–34 distinguish request, sign-in, transport, HTTP status, response, output and timeout. Keep stderr generic.
+- The HTTP request is capped at 85 seconds and the process at 89 seconds.
+
 ## Git Commit Notes
 
 - Before committing, conduct a code review by running:

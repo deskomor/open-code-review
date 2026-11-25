@@ -4,6 +4,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/alibaba/open-code-review/internal/config/rules"
@@ -531,6 +532,33 @@ func TestWhyExcluded_SecretPath(t *testing.T) {
 	}
 }
 
+func TestFactoryRootReadmeSelection(t *testing.T) {
+	standard := New(Args{})
+	factory := New(Args{FactoryRootReadme: true})
+	if standard.whyExcluded(model.Diff{OldPath: "README.md", NewPath: "README.md"}) != ExcludeExtension || standard.ruleConfigSHA256() == factory.ruleConfigSHA256() {
+		t.Fatal("default and Factory selection must stay distinct")
+	}
+	for path, want := range map[string]ExcludeReason{"README.md": ExcludeNone, "readme.md": ExcludeExtension, "nested/README.md": ExcludeExtension} {
+		if got := factory.whyExcluded(model.Diff{OldPath: path, NewPath: path}); got != want {
+			t.Errorf("%s: got %s, want %s", path, got, want)
+		}
+	}
+	for _, old := range []string{"nested/README.md", "readme.md"} {
+		if got := factory.whyExcluded(model.Diff{OldPath: old, NewPath: "README.md", IsRenamed: true}); got != ExcludeExtension {
+			t.Errorf("rename from %s: got %s, want %s", old, got, ExcludeExtension)
+		}
+	}
+	for _, d := range []model.Diff{{OldPath: "/dev/null", NewPath: "README.md", IsNew: true}, {OldPath: "README.md", NewPath: "/dev/null", IsDeleted: true}} {
+		if got := factory.whyExcluded(d); got != ExcludeNone {
+			t.Errorf("%s -> %s: got %s", d.OldPath, d.NewPath, got)
+		}
+	}
+	factory.args.FileFilter = &rules.FileFilter{Exclude: []string{"README.md"}}
+	if factory.whyExcluded(model.Diff{OldPath: "README.md", NewPath: "README.md"}) != ExcludeUserRule {
+		t.Fatal("explicit exclusion was bypassed")
+	}
+}
+
 func TestWhyExcluded_SecretRename(t *testing.T) {
 	agent := New(Args{
 		FileFilter: &rules.FileFilter{
@@ -566,6 +594,22 @@ func TestSelectFilesDeletionGate(t *testing.T) {
 	if decisions[1].selected() || decisions[1].Reason != ExcludeDeleted {
 		t.Errorf("gone.go = (selected=%v, reason=%q), want (false, %q)",
 			decisions[1].selected(), decisions[1].Reason, ExcludeDeleted)
+	}
+}
+
+// In Factory review, eligible removals are reviewed under the same size limit as other patches.
+func TestSelectFilesFactoryDeletionGate(t *testing.T) {
+	a := New(Args{FactoryReview: true})
+	a.args.Template.MaxTokens = 100
+	small := model.Diff{OldPath: "gone.go", NewPath: "/dev/null", IsDeleted: true, Diff: "@@ -1 +0,0 @@\n-old\n"}
+	large := small
+	large.Diff = strings.Repeat("-removed line\n", 500)
+	decisions := a.selectFiles([]model.Diff{small, large})
+	if !decisions[0].selected() || decisions[0].Reason != ExcludeNone {
+		t.Fatalf("small deletion was not selected: %q", decisions[0].Reason)
+	}
+	if decisions[1].selected() || decisions[1].Reason != ExcludeTooLarge {
+		t.Fatalf("oversized deletion: got %q, want %q", decisions[1].Reason, ExcludeTooLarge)
 	}
 }
 

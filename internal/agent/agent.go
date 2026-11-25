@@ -77,7 +77,11 @@ type Args struct {
 
 	// FileFilter holds user-configured include/exclude path patterns from rule.json.
 	// When nil, only the default extension and path filters apply.
-	FileFilter *rules.FileFilter
+	FileFilter        *rules.FileFilter
+	FactoryRootReadme bool
+	// FactoryReview dispatches deleted files for review. Factory sets it; upstream keeps
+	// deletions in the change list without reviewing them.
+	FactoryReview bool
 
 	// LLM client for model inference.
 	LLMClient llm.LLMClient
@@ -178,16 +182,18 @@ type RuntimeConfig struct {
 // compression / token aggregation now live in internal/llmloop.Runner; this
 // struct holds the diff-side state and orchestrates per-group subtasks.
 type Agent struct {
-	args            Args
-	diffs           []model.Diff // parsed diffs
-	totalInsertions int64
-	totalDeletions  int64
-	currentDate     string
-	session         *session.SessionHistory
-	subtaskFailed   int64 // count of failed subtasks, accessed atomically
-	runner          *reviewtask.Runner
-	resumeInfo      *ResumeInfo
-	budgetExceeded  atomic.Bool // set when a token/tool-call budget gate stopped dispatch
+	// Eligible oversize deletions affect workspace identity but are never dispatched.
+	workspaceIdentityOnly []model.Diff
+	args                  Args
+	diffs                 []model.Diff // parsed diffs
+	totalInsertions       int64
+	totalDeletions        int64
+	currentDate           string
+	session               *session.SessionHistory
+	subtaskFailed         int64 // count of failed subtasks, accessed atomically
+	runner                *reviewtask.Runner
+	resumeInfo            *ResumeInfo
+	budgetExceeded        atomic.Bool // set when a token/tool-call budget gate stopped dispatch
 
 	fileGroups []FileGroup // semantic grouping result, stored for JSON output
 
@@ -320,7 +326,7 @@ func (a *Agent) Run(ctx context.Context) ([]model.LlmComment, error) {
 	// Apply the one pre-dispatch selection — the same call `--preview` makes —
 	// so the set reported here is the set registerCoverage seals below.
 	decisions := a.selectFiles(a.diffs)
-	kept, counts := summarizeSelection(decisions)
+	kept, counts := a.reduceSelection(decisions)
 	totalChanged := len(a.diffs)
 	reviewCount := counts.Selected
 	fmt.Fprintf(stdout.Writer(), "[ocr] %d file(s) changed, reviewing %d in %s\n", totalChanged, reviewCount, a.args.RepoDir)
@@ -479,7 +485,7 @@ func (a *Agent) ResumeInfo() *ResumeInfo {
 
 // FilesReviewed returns the number of dispatchable files included in this review.
 func (a *Agent) FilesReviewed() int64 {
-	return countDispatchable(a.diffs)
+	return a.countDispatchable(a.diffs)
 }
 
 // Diffs returns the parsed diffs loaded by the agent.
@@ -653,16 +659,17 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 
 	toDispatch := a.applyResume(a.diffs)
 
-	// Filter out deleted files before grouping.
-	var nonDeleted []model.Diff
-	for _, d := range toDispatch {
-		if !d.IsDeleted {
-			nonDeleted = append(nonDeleted, d)
+	// Factory review groups removed files too; upstream keeps them out of dispatch.
+	if !a.args.FactoryReview {
+		var nonDeleted []model.Diff
+		for _, d := range toDispatch {
+			if !d.IsDeleted {
+				nonDeleted = append(nonDeleted, d)
+			}
 		}
+		toDispatch = nonDeleted
 	}
-
-	// Group files semantically via LLM.
-	groupResult := groupDiffs(ctx, nonDeleted, a.args.LLMClient, a.args.Model,
+	groupResult := groupDiffs(ctx, toDispatch, a.args.LLMClient, a.args.Model,
 		a.args.Template, llmloop.PromptTokenLimit(a.args.Template.MaxTokens),
 		&groupingSessionOpts{session: a.session, provider: a.args.Provider, model: a.args.Model})
 	groups := groupResult.groups
@@ -745,7 +752,7 @@ dispatchLoop:
 					for _, d := range g.Diffs {
 						fingerprint := reviewItemFingerprint(a.reviewMode(), d)
 						a.markFailed(d, session.FailurePanic, "subtask panicked during review")
-						a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, fmt.Sprintf("panic: %v", r))
+						a.session.RecordReviewItemFailed(effectivePath(d), d.OldPath, d.NewPath, fingerprint, fmt.Sprintf("panic: %v", r))
 					}
 					fmt.Fprintf(stdout.Writer(), "[ocr] Subtask panic for group %q: %v\n%s\n", g.Label, r, debug.Stack())
 					telemetry.ErrorEvent(ctx, "subtask.panic", fmt.Errorf("panic: %v", r),
@@ -770,7 +777,7 @@ dispatchLoop:
 				for _, d := range g.Diffs {
 					fingerprint := reviewItemFingerprint(a.reviewMode(), d)
 					a.markFailed(d, class, reason)
-					a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, err.Error())
+					a.session.RecordReviewItemFailed(effectivePath(d), d.OldPath, d.NewPath, fingerprint, err.Error())
 				}
 				fmt.Fprintf(stdout.Writer(), "[ocr] Subtask error for group %q: %v\n", g.Label, err)
 				telemetry.ErrorEvent(groupCtx, "subtask.error", err,
@@ -790,14 +797,14 @@ dispatchLoop:
 					var failedCount int64
 					for _, d := range g.Diffs {
 						fingerprint := reviewItemFingerprint(a.reviewMode(), d)
-						if comments := a.args.CommentCollector.CommentsForPath(d.NewPath); len(comments) > 0 {
+						if comments := a.args.CommentCollector.CommentsForPath(effectivePath(d)); len(comments) > 0 {
 							a.markCompleted(d)
-							a.session.RecordReviewItemDone(d.NewPath, d.OldPath, d.NewPath, fingerprint, comments)
+							a.session.RecordReviewItemDone(effectivePath(d), d.OldPath, d.NewPath, fingerprint, comments)
 							continue
 						}
 						a.markFailed(d, stop.class, stop.reason)
 						if stop.checkpoint != "" {
-							a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, stop.checkpoint)
+							a.session.RecordReviewItemFailed(effectivePath(d), d.OldPath, d.NewPath, fingerprint, stop.checkpoint)
 						}
 						failedCount++
 					}
@@ -819,9 +826,9 @@ dispatchLoop:
 			}
 			for _, d := range g.Diffs {
 				fingerprint := reviewItemFingerprint(a.reviewMode(), d)
-				comments := a.args.CommentCollector.CommentsForPath(d.NewPath)
+				comments := a.args.CommentCollector.CommentsForPath(effectivePath(d))
 				a.markCompleted(d)
-				a.session.RecordReviewItemDone(d.NewPath, d.OldPath, d.NewPath, fingerprint, comments)
+				a.session.RecordReviewItemDone(effectivePath(d), d.OldPath, d.NewPath, fingerprint, comments)
 			}
 		}(group)
 	}
@@ -908,7 +915,7 @@ func (a *Agent) applyResume(diffs []model.Diff) []model.Diff {
 		reused++
 	}
 
-	rerun := countDispatchable(toDispatch)
+	rerun := a.countDispatchable(toDispatch)
 	a.resumeInfo = &ResumeInfo{
 		ResumedFrom:   resume.SessionID,
 		ReusedFiles:   reused,
@@ -920,10 +927,10 @@ func (a *Agent) applyResume(diffs []model.Diff) []model.Diff {
 	return toDispatch
 }
 
-func countDispatchable(diffs []model.Diff) int64 {
+func (a *Agent) countDispatchable(diffs []model.Diff) int64 {
 	var n int64
 	for _, d := range diffs {
-		if !d.IsDeleted {
+		if !d.IsDeleted || a.args.FactoryReview {
 			n++
 		}
 	}
@@ -1045,8 +1052,8 @@ func (a *Agent) sourceArtifactSHA256() string {
 	pairs := make([]pair, 0, len(a.diffs))
 	seen := make(map[string]struct{}, len(a.diffs))
 	workspace := a.reviewMode() == session.ReviewModeWorkspace
-	for _, d := range a.diffs {
-		if d.IsDeleted && !workspace {
+	for _, d := range append(a.diffs[:len(a.diffs):len(a.diffs)], a.workspaceIdentityOnly...) {
+		if d.IsDeleted && !workspace && !a.args.FactoryReview {
 			continue
 		}
 		id := a.manifestItemID(d)
@@ -1077,6 +1084,9 @@ func (a *Agent) ruleConfigSHA256() string {
 	var fields []string
 	if cc, ok := a.args.SystemRule.(interface{ CanonicalConfig() []string }); ok {
 		fields = append(fields, cc.CanonicalConfig()...)
+	}
+	if a.args.FactoryRootReadme {
+		fields = append(fields, "factory-root-readme")
 	}
 	if f := a.args.FileFilter; f != nil {
 		for _, inc := range f.Include {
@@ -1272,7 +1282,7 @@ func (a *Agent) registerCoverage(diffs []model.Diff) error {
 		return nil
 	}
 	for _, d := range diffs {
-		if d.IsDeleted {
+		if d.IsDeleted && !a.args.FactoryReview {
 			continue
 		}
 		if err := b.RegisterSelected(a.coverageItem(d)); err != nil {
@@ -1394,7 +1404,7 @@ func (a *Agent) checkPromptBudget(ctx context.Context, messages []llm.Message, g
 // groupHasComments reports whether any file in the group has comments.
 func (a *Agent) groupHasComments(g FileGroup) bool {
 	for _, d := range g.Diffs {
-		if len(a.args.CommentCollector.CommentsForPath(d.NewPath)) > 0 {
+		if len(a.args.CommentCollector.CommentsForPath(effectivePath(d))) > 0 {
 			return true
 		}
 	}
@@ -1484,7 +1494,7 @@ func (a *Agent) executeGroupSubtask(ctx context.Context, g FileGroup) (bool, *su
 	// Per-path baselines for concurrency-safe round-delta computation.
 	baseline := make(map[string]int, len(g.Diffs))
 	for _, d := range g.Diffs {
-		baseline[d.NewPath] = len(a.args.CommentCollector.CommentsForPath(d.NewPath))
+		baseline[effectivePath(d)] = len(a.args.CommentCollector.CommentsForPath(effectivePath(d)))
 	}
 
 	var (
@@ -1557,11 +1567,11 @@ func (a *Agent) executeGroupSubtask(ctx context.Context, g FileGroup) (bool, *su
 		// Compute newly confirmed comments from this round.
 		var newlyConfirmed []model.LlmComment
 		for _, d := range g.Diffs {
-			all := a.args.CommentCollector.CommentsForPath(d.NewPath)
-			if b := baseline[d.NewPath]; len(all) > b {
+			all := a.args.CommentCollector.CommentsForPath(effectivePath(d))
+			if b := baseline[effectivePath(d)]; len(all) > b {
 				newlyConfirmed = append(newlyConfirmed, all[b:]...)
 			}
-			baseline[d.NewPath] = len(all)
+			baseline[effectivePath(d)] = len(all)
 		}
 		confirmed = append(confirmed, newlyConfirmed...)
 
@@ -1662,7 +1672,7 @@ func buildConcatenatedDiffs(diffs []model.Diff) string {
 	var sb strings.Builder
 	for i, d := range diffs {
 		sb.WriteString("<file path=\"")
-		sb.WriteString(d.NewPath)
+		sb.WriteString(effectivePath(d))
 		sb.WriteString("\">\n")
 		sb.WriteString(d.Diff)
 		sb.WriteString("\n</file>")
@@ -1739,7 +1749,7 @@ func (a *Agent) resolveGroupSystemRule(diffs []model.Diff) string {
 	// provider caches reuse. Clone first: the caller's slice is shared state.
 	sorted := slices.Clone(diffs)
 	slices.SortStableFunc(sorted, func(x, y model.Diff) int {
-		return strings.Compare(x.NewPath, y.NewPath)
+		return strings.Compare(effectivePath(x), effectivePath(y))
 	})
 
 	type ruleBlock struct {
@@ -1749,16 +1759,17 @@ func (a *Agent) resolveGroupSystemRule(diffs []model.Diff) string {
 	var blocks []ruleBlock
 	index := make(map[string]int, len(sorted))
 	for _, d := range sorted {
-		r := a.args.SystemRule.Resolve(d.NewPath)
+		path := effectivePath(d)
+		r := a.args.SystemRule.Resolve(path)
 		if r == "" {
 			continue
 		}
 		if i, ok := index[r]; ok {
-			blocks[i].paths = append(blocks[i].paths, d.NewPath)
+			blocks[i].paths = append(blocks[i].paths, path)
 			continue
 		}
 		index[r] = len(blocks)
-		blocks = append(blocks, ruleBlock{rule: r, paths: []string{d.NewPath}})
+		blocks = append(blocks, ruleBlock{rule: r, paths: []string{path}})
 	}
 
 	if len(blocks) == 0 {
@@ -1864,10 +1875,10 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 	}
 	var candidates []filterCandidate
 	for _, d := range g.Diffs {
-		all := a.args.CommentCollector.CommentsForPath(d.NewPath)
+		all := a.args.CommentCollector.CommentsForPath(effectivePath(d))
 		start := 0
 		if from != nil {
-			start = from[d.NewPath]
+			start = from[effectivePath(d)]
 			if start > len(all) {
 				start = len(all)
 			}

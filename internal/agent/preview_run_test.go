@@ -390,6 +390,112 @@ func TestPreviewMatchesRunSelectedCoverage(t *testing.T) {
 	}
 }
 
+// TestPreviewMatchesRunSelectedCoverage is the property #782 asked for:
+// preview's will_review set must equal the set a fresh, non-resumed,
+// unbudgeted run registers as selected coverage. The changeset deliberately
+// mixes every outcome — reviewable, extension-filtered, deleted, and oversized
+// — so a gate applied on only one of the two paths breaks the comparison.
+func TestPreviewMatchesRunSelectedCoverageFactoryReview(t *testing.T) {
+	dir := initPreviewRepo(t)
+
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	write("main.go", "package main\n")
+	write("notes.md", "# notes\n")
+	write("huge.go", strings.Repeat("token ", 2000))
+	if err := os.Remove(filepath.Join(dir, "gone.go")); err != nil {
+		t.Fatalf("remove gone.go: %v", err)
+	}
+
+	// The ceiling lands at 800 tokens: huge.go is over it, main.go's rendered
+	// prompt stays far under, so only the size gate separates the two.
+	args := Args{
+		RepoDir:       dir,
+		LLMClient:     manifestFlowClient{},
+		FactoryReview: true,
+		Model:         "fake",
+		Template: template.Template{
+			MaxTokens:           1000,
+			MaxToolRequestTimes: 5,
+			MainTask: template.LlmConversation{
+				Messages: []template.ChatMessage{{Role: "user", Content: "Review {{current_file_path}} {{diff}}"}},
+			},
+		},
+		MainToolDefs: []llm.ToolDef{{
+			Type:     "function",
+			Function: llm.FunctionDef{Name: "task_done", Description: "finish the review"},
+		}},
+	}
+
+	preview, err := Preview(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Preview error: %v", err)
+	}
+	var previewed []string
+	byPath := make(map[string]DiffPreviewEntry, len(preview.Entries))
+	for _, e := range preview.Entries {
+		byPath[e.Path] = e
+		if e.WillReview {
+			previewed = append(previewed, e.Path)
+		}
+	}
+	slices.Sort(previewed)
+	if !slices.Equal(previewed, []string{"gone.go", "main.go"}) {
+		t.Fatalf("preview will_review = %v, want [gone.go main.go]; entries = %+v", previewed, preview.Entries)
+	}
+	// Pin the fixture itself: the comparison below is only meaningful while each
+	// exclusion path is actually represented.
+	for path, want := range map[string]ExcludeReason{
+		"notes.md": ExcludeExtension,
+		"huge.go":  ExcludeTooLarge,
+	} {
+		if got := byPath[path].ExcludeReason; got != want {
+			t.Fatalf("%s exclude_reason = %q, want %q", path, got, want)
+		}
+	}
+
+	a := New(args)
+	if _, err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	manifest := a.RunManifest()
+	if manifest == nil {
+		t.Fatal("expected a frozen run manifest")
+	}
+	var selected []string
+	for _, item := range manifest.Coverage.Selected {
+		selected = append(selected, item.Path)
+	}
+
+	slices.Sort(previewed)
+	slices.Sort(selected)
+	if !slices.Equal(previewed, selected) {
+		t.Errorf("preview will_review = %v but the run selected %v", previewed, selected)
+	}
+
+	// The files preview reported as excluded reach the manifest with the same
+	// reason, and they leave the selected-set outcome alone.
+	excluded := make(map[string]ExcludeReason, len(manifest.Coverage.Excluded))
+	for _, item := range manifest.Coverage.Excluded {
+		excluded[item.Path] = item.ExcludeReason
+	}
+	if len(excluded) != 2 {
+		t.Errorf("run excluded = %v, want notes.md and huge.go", excluded)
+	}
+	for path, got := range excluded {
+		if want := byPath[path].ExcludeReason; got != want {
+			t.Errorf("%s: run exclude_reason = %q, preview = %q", path, got, want)
+		}
+	}
+	if manifest.TerminalState != session.StateComplete {
+		t.Errorf("terminal_state = %q, want complete with only excluded files left out", manifest.TerminalState)
+	}
+}
+
 // TestPreviewEmptyEntriesNotNil pins that a clean workspace still yields a
 // non-nil Entries slice, so JSON output marshals `"files":[]` instead of
 // `"files":null`. Scan preview already guarantees this; review must agree.

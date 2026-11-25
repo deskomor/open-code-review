@@ -150,6 +150,43 @@ func TestSourceArtifactSHA256_WorkspaceCoversDeletedInputs(t *testing.T) {
 	}
 }
 
+func TestSourceArtifactSHA256_FactoryRangeCoversDeletedInputs(t *testing.T) {
+	// Workspace reviews have no fixed endpoints to seal their old side, so a
+	// tracked-file deletion is an input change: the deleted file is not
+	// dispatched as a review item, but removing it can change what the remaining
+	// files mean (a helper it defined disappears). Range and commit reviews are
+	// sealed by their endpoints and keep ignoring deletions here.
+	modified := model.Diff{OldPath: "a.go", NewPath: "a.go", Diff: "@@ modified a.go @@"}
+	deleted := model.Diff{OldPath: "b.go", NewPath: "b.go", Diff: "@@ deleted b.go @@", IsDeleted: true}
+	restored := model.Diff{OldPath: "b.go", NewPath: "b.go", Diff: "@@ restored b.go @@"}
+
+	workspace := New(Args{ReviewMode: session.ReviewModeWorkspace})
+	workspace.diffs = []model.Diff{modified}
+
+	workspaceDeleted := New(Args{ReviewMode: session.ReviewModeWorkspace})
+	workspaceDeleted.diffs = []model.Diff{modified, deleted}
+
+	workspaceRestored := New(Args{ReviewMode: session.ReviewModeWorkspace})
+	workspaceRestored.diffs = []model.Diff{modified, restored}
+
+	if workspace.sourceArtifactSHA256() == workspaceDeleted.sourceArtifactSHA256() {
+		t.Error("workspace identity did not change when an unchanged tracked file was deleted")
+	}
+	if workspaceDeleted.sourceArtifactSHA256() == workspaceRestored.sourceArtifactSHA256() {
+		t.Error("workspace identity did not change when the parent's deleted file was restored")
+	}
+
+	rng := New(Args{From: "main", To: "feature", FactoryReview: true})
+	rng.diffs = []model.Diff{modified}
+
+	rngDeleted := New(Args{From: "main", To: "feature", FactoryReview: true})
+	rngDeleted.diffs = []model.Diff{modified, deleted}
+
+	if rng.sourceArtifactSHA256() == rngDeleted.sourceArtifactSHA256() {
+		t.Error("range identity must include the selected removal patch")
+	}
+}
+
 func TestRuntimeConfigSHA256(t *testing.T) {
 	baseArgs := Args{
 		Model:          "m",

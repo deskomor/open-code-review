@@ -922,6 +922,34 @@ func TestSummarizeSelection(t *testing.T) {
 	}
 }
 
+// In Factory review, deletions that pass every gate are selected and reviewed.
+func TestSummarizeSelectionFactoryReview(t *testing.T) {
+	a := New(Args{Template: template.Template{MaxTokens: 100}, FactoryReview: true})
+	diffs := []model.Diff{
+		{NewPath: "main.go", Insertions: 10, Deletions: 2},
+		{NewPath: "deleted.go", IsDeleted: true, Deletions: 20},
+		{NewPath: "binary.bin", IsBinary: true},
+		{NewPath: "helper.go", Insertions: 5},
+		{NewPath: "huge.go", Diff: strings.Repeat("word ", 500)},
+	}
+
+	kept, counts := summarizeSelection(a.selectFiles(diffs))
+	if counts.Selected != 3 {
+		t.Errorf("selected = %d, want main.go, deleted.go and helper.go", counts.Selected)
+	}
+	if counts.TooLarge != 1 {
+		t.Errorf("tooLarge = %d, want 1 (huge.go)", counts.TooLarge)
+	}
+	var keptPaths []string
+	for _, d := range kept {
+		keptPaths = append(keptPaths, d.NewPath)
+	}
+	want := []string{"main.go", "deleted.go", "helper.go"}
+	if !slices.Equal(keptPaths, want) {
+		t.Errorf("kept = %v, want %v", keptPaths, want)
+	}
+}
+
 func TestBuildChangeFilesExceptGroup(t *testing.T) {
 	a := New(Args{})
 	a.diffs = []model.Diff{
@@ -1303,6 +1331,24 @@ func TestDispatchSubtasks_AllDeleted(t *testing.T) {
 	}
 	if client.calls != 0 {
 		t.Errorf("expected 0 LLM calls, got %d", client.calls)
+	}
+}
+
+// In Factory review, a removal-only change is reviewed and covered.
+func TestDispatchSubtasksFactoryReviewsDeleted(t *testing.T) {
+	const patch = "--- a/removed.go\n+++ /dev/null\n@@ -1 +0,0 @@\n-package removed\n"
+	spy := &promptSpy{}
+	a := newManifestFlowAgentWithClient(t, []model.Diff{{OldPath: "removed.go", NewPath: "/dev/null", IsDeleted: true, Diff: patch, Deletions: 1}}, nil, spy)
+	a.args.FactoryReview = true
+	if _, err := a.dispatchSubtasks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(spy.prompts, "\n"), "<file path=\"removed.go\">\n"+patch) {
+		t.Fatal("missing removed.go patch in review request")
+	}
+	manifest := finishManifestFlow(t, a)
+	if len(manifest.Coverage.Completed) != 1 || manifest.Coverage.Completed[0].Path != "removed.go" {
+		t.Fatalf("completed = %+v", manifest.Coverage.Completed)
 	}
 }
 

@@ -53,7 +53,7 @@ type Estimate struct {
 // both by the aggregate estimate (estimateDiffCost) and by the per-group budget
 // look-ahead in dispatchSubtasks, which sums this over a group's diffs.
 func estimateDiffFileTokens(d model.Diff) int64 {
-	if d.IsDeleted || d.Diff == "" {
+	if d.Diff == "" {
 		return 0
 	}
 	diffTokens := int64(llm.CountTokens(d.Diff))
@@ -73,7 +73,7 @@ func estimateDiffFileTokens(d model.Diff) int64 {
 func estimateDiffCost(diffs []model.Diff) Estimate {
 	var est Estimate
 	for _, d := range diffs {
-		if d.IsDeleted || d.Diff == "" {
+		if d.Diff == "" {
 			continue
 		}
 		est.Files++

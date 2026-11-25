@@ -89,6 +89,22 @@ func TestAgentFilesReviewedCountsDispatchableDiffs(t *testing.T) {
 	}
 }
 
+func TestAgentFilesReviewedCountsDeletionsInFactoryReview(t *testing.T) {
+	a := New(Args{FactoryReview: true})
+	a.diffs = []model.Diff{
+		{NewPath: "kept.go", OldPath: "kept.go", Diff: "+kept"},
+		{NewPath: "removed.go", OldPath: "removed.go", Diff: "-removed", IsDeleted: true},
+		{NewPath: "also-kept.go", OldPath: "also-kept.go", Diff: "+more"},
+	}
+
+	if got := a.FilesReviewed(); got != 3 {
+		t.Errorf("FilesReviewed() = %d, want 3", got)
+	}
+	if got := len(a.Diffs()); got != 3 {
+		t.Errorf("Diffs() len = %d, want 3", got)
+	}
+}
+
 func TestAgent_RecordWarning(t *testing.T) {
 	tmpDir := t.TempDir()
 	sess := session.New(tmpDir, "main", "test-model", session.SessionOptions{ReviewMode: "diff"})
